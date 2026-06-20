@@ -1,4 +1,3 @@
-<img width="1914" height="324" alt="image" src="https://github.com/user-attachments/assets/3c689caa-0582-4423-abc3-c7423c29fc70" /># django-agar-io
 
 ```
 cd agar.io
