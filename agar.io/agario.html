@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <title>Agar.io Full Offline Clone</title>
+    <style>
+        body, html { margin: 0; padding: 0; overflow: hidden; background-color: #f2fbff; font-family: sans-serif; }
+        canvas { display: block; }
+        #ui { position: absolute; top: 10px; left: 10px; pointer-events: none; }
+        .score { font-size: 24px; font-weight: bold; color: #333; text-shadow: 1px 1px 2px white; }
+        #leaderboard { position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.5); color: white; padding: 10px; border-radius: 5px; pointer-events: none; min-width: 150px; }
+        #leaderboard h3 { margin: 0 0 10px 0; font-size: 16px; text-align: center; }
+        #leaderboard ol { margin: 0; padding-left: 20px; font-size: 14px; }
+    </style>
+</head>
+<body>
+
+<div id="ui">
+    <div class="score">Маса: <span id="scoreText">10</span></div>
+</div>
+<div id="leaderboard">
+    <h3>Лідерборд</h3>
+    <ol id="lbList"></ol>
+</div>
+
+<canvas id="gameCanvas"></canvas>
+
+<script>
+    const canvas = document.getElementById("gameCanvas");
+    const ctx = canvas.getContext("2d");
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    // Налаштування світу
+    const WORLD_SIZE = 4000;
+    const INIT_MASS = 10;
+    const FOOD_COUNT = 800;
+    const BOT_COUNT = 25;
+    const VIRUS_COUNT = 20;
+
+    let mouse = { x: canvas.width / 2, y: canvas.height / 2, worldX: 0, worldY: 0 };
+    let keys = { space: false, w: false };
+    
+    window.addEventListener('mousemove', e => {
+        mouse.x = e.clientX;
+        mouse.y = e.clientY;
+    });
+    window.addEventListener('keydown', e => {
+        if(e.code === 'Space' && !keys.space) { keys.space = true; splitCells(0); }
+        if(e.code === 'KeyW' && !keys.w) { keys.w = true; ejectMass(0); }
+    });
+    window.addEventListener('keyup', e => {
+        if(e.code === 'Space') keys.space = false;
+        if(e.code === 'KeyW') keys.w = false;
+    });
+    window.addEventListener('resize', () => {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+    });
+
+    // Масиви об'єктів
+    let cells = [];
+    let foods = [];
+    let viruses = [];
+    let ejected = [];
+    
+    let camera = { x: WORLD_SIZE/2, y: WORLD_SIZE/2, zoom: 1 };
+    let colors = ['#f34336', '#e81e63', '#9c27b0', '#3f51b5', '#2196f3', '#00bcd4', '#4caf50', '#ff9800', '#ff5722'];
+
+    function getRadius(mass) { return Math.sqrt(mass) * 10; }
+    function randomColor() { return colors[Math.floor(Math.random() * colors.length)]; }
+
+    class Cell {
+        constructor(x, y, mass, color, playerId, name) {
+            this.x = x; this.y = y;
+            this.mass = mass; this.color = color;
+            this.playerId = playerId; // 0 = гравець, >0 = боти
+            this.name = name;
+            this.vx = 0; this.vy = 0;
+            this.targetX = x; this.targetY = y;
+            this.mergeTimer = Date.now() + 10000; // 10 сек до злиття після поділу
+        }
+        
+        update() {
+            let radius = getRadius(this.mass);
+            let speed = 30 / Math.pow(radius, 0.43);
+
+            // Застосування імпульсу (від поділу/викиду)
+            this.x += this.vx; this.y += this.vy;
+            this.vx *= 0.85; this.vy *= 0.85; // Тертя
+
+            // Рух до цілі
+            if (Math.abs(this.vx) < 0.1 && Math.abs(this.vy) < 0.1) {
+                let dx = this.targetX - this.x;
+                let dy = this.targetY - this.y;
+                let dist = Math.hypot(dx, dy);
+                if (dist > speed) {
+                    this.x += (dx / dist) * speed;
+                    this.y += (dy / dist) * speed;
+                }
+            }
+
+            // Межі карти
+            this.x = Math.max(radius, Math.min(WORLD_SIZE - radius, this.x));
+            this.y = Math.max(radius, Math.min(WORLD_SIZE - radius, this.y));
+            
+            // Втрата маси з часом (якщо великий)
+            if(this.mass > 20) this.mass *= 0.9998;
+        }
+
+        draw() {
+            let radius = getRadius(this.mass);
+            ctx.beginPath();
+            ctx.arc(this.x, this.y, radius, 0, Math.PI * 2);
+            ctx.fillStyle = this.color;
+            ctx.fill();
+            ctx.strokeStyle = '#00000044';
+            ctx.lineWidth = radius * 0.1;
+            ctx.stroke();
+
+            // Ім'я та маса
+            if(radius > 20) {
+                ctx.fillStyle = 'white';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.lineWidth = 3;
+                ctx.strokeStyle = 'black';
+                
+                ctx.font = `bold ${radius * 0.4}px sans-serif`;
+                ctx.strokeText(this.name, this.x, this.y - radius*0.2);
+                ctx.fillText(this.name, this.x, this.y - radius*0.2);
+                
+                ctx.font = `bold ${radius * 0.3}px sans-serif`;
+                ctx.strokeText(Math.floor(this.mass), this.x, this.y + radius*0.3);
+                ctx.fillText(Math.floor(this.mass), this.x, this.y + radius*0.3);
+            }
+        }
+    }
+
+    // Ініціалізація
+    function init() {
+        cells = [new Cell(WORLD_SIZE/2, WORLD_SIZE/2, INIT_MASS, '#2196f3', 0, 'Гравець')];
+        for(let i=0; i<FOOD_COUNT; i++) spawnFood();
+        for(let i=1; i<=BOT_COUNT; i++) spawnBot(i);
+        for(let i=0; i<VIRUS_COUNT; i++) spawnVirus();
+    }
+
+    function spawnFood() {
+        foods.push({
+            x: Math.random() * WORLD_SIZE, y: Math.random() * WORLD_SIZE,
+            color: randomColor(), radius: 3 + Math.random()*2
+        });
+    }
+
+    function spawnBot(id) {
+        cells.push(new Cell(Math.random() * WORLD_SIZE, Math.random() * WORLD_SIZE, INIT_MASS + Math.random()*20, randomColor(), id, 'Bot ' + id));
+    }
+
+    function spawnVirus() {
+        viruses.push({ x: Math.random() * WORLD_SIZE, y: Math.random() * WORLD_SIZE, mass: 100 });
+    }
+
+    // Механіка поділу (Space)
+    function splitCells(playerId) {
+        let playerCells = cells.filter(c => c.playerId === playerId);
+        playerCells.forEach(c => {
+            if (c.mass >= 36) {
+                c.mass /= 2;
+                let newCell = new Cell(c.x, c.y, c.mass, c.color, playerId, c.name);
+                
+                // Визначення напрямку викиду
+                let dx = c.targetX - c.x;
+                let dy = c.targetY - c.y;
+                let dist = Math.hypot(dx, dy) || 1;
+                
+                newCell.vx = (dx / dist) * 40;
+                newCell.vy = (dy / dist) * 40;
+                newCell.mergeTimer = Date.now() + 20000;
+                c.mergeTimer = Date.now() + 20000;
+                cells.push(newCell);
+            }
+        });
+    }
+
+    // Механіка викидання маси (W)
+    function ejectMass(playerId) {
+        let playerCells = cells.filter(c => c.playerId === playerId);
+        playerCells.forEach(c => {
+            if (c.mass >= 20) {
+                c.mass -= 1.5;
+                let dx = c.targetX - c.x;
+                let dy = c.targetY - c.y;
+                let dist = Math.hypot(dx, dy) || 1;
+                let r = getRadius(c.mass);
+                
+                ejected.push({
+                    x: c.x + (dx/dist)*r, y: c.y + (dy/dist)*r,
+                    vx: (dx/dist)*20, vy: (dy/dist)*20,
+                    mass: 1, color: c.color
+                });
+            }
+        });
+    }
+
+    // Поведінка ботів
+    function updateBots() {
+        let bots = [...new Set(cells.filter(c => c.playerId > 0).map(c => c.playerId))];
+        
+        bots.forEach(botId => {
+            let botCells = cells.filter(c => c.playerId === botId);
+            if(botCells.length === 0) { spawnBot(botId); return; } // Респаун
+            
+            botCells.forEach(bot => {
+                if(Math.random() < 0.05) { // Зміна цілі кожні ~20 кадрів
+                    let closest = null, minDist = Infinity;
+                    
+                    // Пошук їжі або менших клітин
+                    foods.forEach(f => {
+                        let d = Math.hypot(bot.x - f.x, bot.y - f.y);
+                        if(d < minDist && d < 400) { minDist = d; closest = f; }
+                    });
+                    
+                    cells.forEach(other => {
+                        if(other.playerId !== botId) {
+                            let d = Math.hypot(bot.x - other.x, bot.y - other.y);
+                            // Тікати якщо ворог більший
+                            if(other.mass > bot.mass * 1.25 && d < 500) {
+                                bot.targetX = bot.x - (other.x - bot.x);
+                                bot.targetY = bot.y - (other.y - bot.y);
+                                closest = null; // Пріоритет - втеча
+                            } 
+                            // Атакувати якщо ворог менший
+                            else if(bot.mass > other.mass * 1.25 && d < 600 && d < minDist) {
+                                minDist = d; closest = other;
+                            }
+                        }
+                    });
+
+                    if(closest) {
+                        bot.targetX = closest.x; bot.targetY = closest.y;
+                    }
+
+                    // Випадковий спліт (дуже рідко)
+                    if(bot.mass > 100 && Math.random() < 0.005) splitCells(botId);
+                }
+            });
+        });
+    }
+
+    function checkCollisions() {
+        // Клітини між собою
+        for (let i = 0; i < cells.length; i++) {
+            for (let j = i + 1; j < cells.length; j++) {
+                let c1 = cells[i], c2 = cells[j];
+                let dist = Math.hypot(c1.x - c2.x, c1.y - c2.y);
+                let r1 = getRadius(c1.mass), r2 = getRadius(c2.mass);
+
+                if (c1.playerId === c2.playerId) {
+                    // Злиття або відштовхування власних клітин
+                    if (dist < r1 + r2) {
+                        if (Date.now() > c1.mergeTimer && Date.now() > c2.mergeTimer) {
+                            c1.mass += c2.mass;
+                            c1.x = (c1.x + c2.x)/2; c1.y = (c1.y + c2.y)/2;
+                            cells.splice(j, 1); j--;
+                        } else {
+                            let overlap = r1 + r2 - dist;
+                            let dx = (c1.x - c2.x) / dist, dy = (c1.y - c2.y) / dist;
+                            c1.x += dx * overlap * 0.1; c1.y += dy * overlap * 0.1;
+                            c2.x -= dx * overlap * 0.1; c2.y -= dy * overlap * 0.1;
+                        }
+                    }
+                } else {
+                    // Поїдання інших
+                    if (dist < Math.max(r1, r2) * 0.8) { // 80% перекриття
+                        if (c1.mass > c2.mass * 1.25) {
+                            c1.mass += c2.mass;
+                            cells.splice(j, 1); j--;
+                        } else if (c2.mass > c1.mass * 1.25) {
+                            c2.mass += c1.mass;
+                            cells.splice(i, 1); i--; break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Клітини з вірусами
+        for(let i = 0; i < cells.length; i++) {
+            let c = cells[i];
+            let r = getRadius(c.mass);
+            for(let j = 0; j < viruses.length; j++) {
+                let v = viruses[j];
+                let vr = getRadius(v.mass);
+                if (Math.hypot(c.x - v.x, c.y - v.y) < r && c.mass > v.mass * 1.25) {
+                    // Вибух об вірус
+                    let pieces = Math.min(10, Math.floor(c.mass / 15));
+                    let massPerPiece = c.mass / pieces;
+                    c.mass = massPerPiece;
+                    for(let k=1; k<pieces; k++) {
+                        let newCell = new Cell(c.x, c.y, massPerPiece, c.color, c.playerId, c.name);
+                        let angle = Math.random() * Math.PI * 2;
+                        newCell.vx = Math.cos(angle) * 30;
+                        newCell.vy = Math.sin(angle) * 30;
+                        newCell.mergeTimer = Date.now() + 15000;
+                        cells.push(newCell);
+                    }
+                    viruses.splice(j, 1);
+                    spawnVirus();
+                    break;
+                }
+            }
+        }
+
+        // Поїдання їжі
+        cells.forEach(c => {
+            let r = getRadius(c.mass);
+            for (let i = 0; i < foods.length; i++) {
+                if (Math.hypot(c.x - foods[i].x, c.y - foods[i].y) < r) {
+                    c.mass += 0.5; // Баланс росту
+                    foods.splice(i, 1);
+                    spawnFood();
+                }
+            }
+            // Поїдання викинутої маси
+            for (let i = 0; i < ejected.length; i++) {
+                if (Math.hypot(c.x - ejected[i].x, c.y - ejected[i].y) < r) {
+                    c.mass += ejected[i].mass;
+                    ejected.splice(i, 1);
+                }
+            }
+        });
+    }
+
+    function updateCameraAndUI() {
+        let playerCells = cells.filter(c => c.playerId === 0);
+        
+        if (playerCells.length > 0) {
+            // Центр мас гравця
+            let totalX = 0, totalY = 0, totalMass = 0;
+            playerCells.forEach(c => {
+                totalX += c.x * c.mass; totalY += c.y * c.mass; totalMass += c.mass;
+            });
+            let targetX = totalX / totalMass;
+            let targetY = totalY / totalMass;
+            
+            // Плавна камера
+            camera.x += (targetX - camera.x) * 0.1;
+            camera.y += (targetY - camera.y) * 0.1;
+            
+            // Віддалення
+            let targetZoom = Math.max(0.2, 1.2 - Math.log10(totalMass / INIT_MASS) * 0.25);
+            camera.zoom += (targetZoom - camera.zoom) * 0.05;
+
+            // Оновлення цілі для клітин гравця (де мишка у світі)
+            mouse.worldX = (mouse.x - canvas.width/2) / camera.zoom + camera.x;
+            mouse.worldY = (mouse.y - canvas.height/2) / camera.zoom + camera.y;
+            playerCells.forEach(c => { c.targetX = mouse.worldX; c.targetY = mouse.worldY; });
+
+            document.getElementById("scoreText").innerText = Math.floor(totalMass);
+        } else {
+            // Гравець помер
+            document.getElementById("scoreText").innerText = "З'їли! Оновіть сторінку.";
+        }
+
+        // Лідерборд
+        let scores = {};
+        cells.forEach(c => { scores[c.name] = (scores[c.name] || 0) + c.mass; });
+        let top = Object.entries(scores).sort((a,b) => b[1]-a[1]).slice(0, 10);
+        document.getElementById("lbList").innerHTML = top.map(t => `<li>${t[0]}: ${Math.floor(t[1])}</li>`).join('');
+    }
+
+    function drawGrid() {
+        ctx.save();
+        ctx.strokeStyle = "#ddd";
+        ctx.lineWidth = 1;
+        let step = 50;
+        let startX = Math.floor((camera.x - (canvas.width/2)/camera.zoom) / step) * step;
+        let startY = Math.floor((camera.y - (canvas.height/2)/camera.zoom) / step) * step;
+        let endX = camera.x + (canvas.width/2)/camera.zoom;
+        let endY = camera.y + (canvas.height/2)/camera.zoom;
+
+        ctx.beginPath();
+        for(let x = startX; x < endX; x += step) {
+            if(x < 0 || x > WORLD_SIZE) continue;
+            ctx.moveTo(x, Math.max(0, startY));
+            ctx.lineTo(x, Math.min(WORLD_SIZE, endY));
+        }
+        for(let y = startY; y < endY; y += step) {
+            if(y < 0 || y > WORLD_SIZE) continue;
+            ctx.moveTo(Math.max(0, startX), y);
+            ctx.lineTo(Math.min(WORLD_SIZE, endX), y);
+        }
+        ctx.stroke();
+        
+        // Межі світу
+        ctx.strokeStyle = "red";
+        ctx.lineWidth = 5;
+        ctx.strokeRect(0, 0, WORLD_SIZE, WORLD_SIZE);
+        ctx.restore();
+    }
+
+    function drawVirus(v) {
+        let r = getRadius(v.mass);
+        ctx.beginPath();
+        for (let i = 0; i < 20; i++) {
+            let angle = (i / 20) * Math.PI * 2;
+            let radiusOffset = i % 2 === 0 ? r * 1.1 : r * 0.9;
+            let x = v.x + Math.cos(angle) * radiusOffset;
+            let y = v.y + Math.sin(angle) * radiusOffset;
+            if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.closePath();
+        ctx.fillStyle = '#33ff33';
+        ctx.fill();
+        ctx.strokeStyle = '#22dd22';
+        ctx.lineWidth = 3;
+        ctx.stroke();
+    }
+
+    function gameLoop() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        updateCameraAndUI();
+        updateBots();
+        checkCollisions();
+
+        // Трансформація камери
+        ctx.save();
+        ctx.translate(canvas.width / 2, canvas.height / 2);
+        ctx.scale(camera.zoom, camera.zoom);
+        ctx.translate(-camera.x, -camera.y);
+
+        drawGrid();
+ 
+        // Малювання їжі
+        foods.forEach(f => {
+            ctx.beginPath(); ctx.arc(f.x, f.y, f.radius, 0, Math.PI*2);
+            ctx.fillStyle = f.color; ctx.fill();
+        });
+
+        // Оновлення та малювання викинутої маси
+        ejected.forEach(e => {
+            e.x += e.vx; e.y += e.vy;
+            e.vx *= 0.9; e.vy *= 0.9; // тертя
+            ctx.beginPath(); ctx.arc(e.x, e.y, getRadius(e.mass), 0, Math.PI*2);
+            ctx.fillStyle = e.color; ctx.fill();
+        });
+
+        viruses.forEach(v => drawVirus(v));
+
+        // Сортування клітин за масою, щоб менші малювалися під більшими
+        cells.sort((a, b) => a.mass - b.mass);
+        cells.forEach(c => { c.update(); c.draw(); });
+
+        ctx.restore();
+        requestAnimationFrame(gameLoop);
+    }
+
+    init();
+    gameLoop();
+</script>
+</body>
+</html>
